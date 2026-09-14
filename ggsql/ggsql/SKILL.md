@@ -129,6 +129,35 @@ SETTING position => 'dodge'      -- side by side (default for boxplot, violin)
 SETTING position => 'jitter'     -- random offset
 ```
 
+**Aggregate** collapses each group to a single row, replacing every numeric mapping in place with its aggregated value. Groups = `PARTITION BY` columns + all discrete mappings. Supported by `point`, `line`, `path`, `bar`, `area`, `ribbon`, `range`, `segment`, `rule`, `text`, `tile`. Not supported by `histogram`, `density`, `smooth`, `boxplot`, `violin` (they have their own stats).
+
+```ggsql
+SETTING aggregate => '<spec>'                -- single
+SETTING aggregate => ('<spec>', '<spec>', …) -- list
+```
+
+Each `<spec>` is either:
+- **Untargeted** — `'<func>'`. Applies to every numeric mapping without an explicit target. With two untargeted defaults, the first applies to lower-side aesthetics (`x`/`xmin`/etc.) plus all non-range layers, the second to upper-side (`xend`/`xmax`). More than two untargeted defaults is an error.
+- **Targeted** — `'<aes>:<func>'`. Applies `func` to the named aesthetic only. Overrides any untargeted default for that aesthetic.
+
+Functions:
+- Standard reductions: `count`, `sum`, `prod`, `min`, `max`, `range` (max−min), `mid` ((min+max)/2), `mean`, `median`, `geomean`, `harmean`, `rms`, `sdev`, `var`, `iqr`, `se`, `p05`–`p95`.
+- Positional (rely on upstream `ORDER BY` for deterministic order): `first`, `last`, `diff` (last − first).
+- Band: `<offset>±[<mult>]<expansion>`, e.g. `'mean+1.96sdev'`, `'median-iqr'`. Offsets: `mean`, `median`, `geomean`, `harmean`, `rms`, `sum`, `prod`, `min`, `max`, `mid`, `p05`–`p95`. Expansions: `sdev`, `se`, `var`, `iqr`, `range`.
+
+**Explosion** — targeting the same aesthetic with multiple functions emits one row per function per group. A synthetic `aggregate` column tags each row with the function name. Use `REMAPPING aggregate AS <aes>` to drive another aesthetic from it. When several aesthetics are exploded with the same length, they explode in lockstep (row 1 = each target's first function, row 2 = second, …); single-function targets are reused on every row. Mixing target lengths > 1 is an error.
+
+```ggsql
+-- min/max envelope as two lines per group, coloured by function
+DRAW line
+  MAPPING Date AS x, Temp AS y
+  REMAPPING aggregate AS color
+  SETTING aggregate => ('y:min', 'y:max')
+  PARTITION BY Year
+```
+
+**Scale interaction** — for an aesthetic that is *targeted* by aggregate, `SCALE BINNED <aes>` runs **after** aggregation (otherwise the diff/mean/etc. would cancel within a bin). Untargeted `SCALE BINNED` still bins pre-aggregate so the bins can drive grouping. Continuous censoring (`SCALE <aes> FROM (lo, hi)`) and discrete OOB filtering defer to post-aggregate whenever the aesthetic is being aggregated (targeted or untargeted default).
+
 ### FILTER
 
 SQL WHERE condition applied to layer data. Content is passed to the database:
@@ -230,6 +259,9 @@ Continuous/binned scales:
 - `breaks` — integer count, array of values, or interval string for temporal (e.g. `'2 months'`, `'week'`)
 - `pretty` — boolean, default `true`. Use Wilkinson's algorithm for nice breaks.
 - `reverse` — boolean, default `false`. Reverse scale direction.
+
+Continuous scales additionally:
+- `minor_breaks` — unlabelled subdivisions between breaks. Integer count **per interval between two breaks** (`0` removes them), array of values, or interval string for temporal. Defaults to a per-transformation value. Only drawn by writers that support minor breaks; Vega-Lite ignores it.
 
 Binned scales additionally:
 - `closed` — `'left'` (default) or `'right'`
@@ -375,7 +407,7 @@ DRAW histogram MAPPING body_mass AS x REMAPPING density AS y  -- density instead
 Kernel density estimation. Required: x. Stats: `density`, `intensity`. Settings: `position` (default `'identity'`), `bandwidth`, `adjust` (default 1), `kernel` (`'gaussian'` default, `'epanechnikov'`, `'triangular'`, `'rectangular'`, `'biweight'`, `'cosine'`).
 
 ### boxplot
-Five-number summary with outliers. Required: x (categorical), y (continuous). Stats: `type`, `value`. Settings: `position` (default `'dodge'`), `outliers` (default true), `coef` (whisker IQR multiple, default 1.5), `width` (default 0.9).
+Five-number summary with outliers. Required: x (categorical), y (continuous). Stats: `type`, `value`. Settings: `position` (default `'dodge'`), `outliers` (default true), `coef` (whisker IQR multiple, default 1.5), `width` (default 0.9), `hinge` (whisker cap width in points, default null/hidden).
 
 ### violin
 Mirrored kernel density for groups. Required: x (categorical), y (continuous). Stats: `density`, `intensity`. Default remapping: `density AS offset`. Settings: `position` (default `'dodge'`), `bandwidth`, `adjust`, `kernel` (same as density), `width` (default 0.9), `side` (`'both'`/`'left'`/`'bottom'`/`'right'`/`'top'`), `tails` (number or null, default 3).
@@ -396,7 +428,7 @@ Line segments between two endpoints. Required: x, y, xend, yend. For axis-aligne
 Reference lines spanning the full panel. Required: x or y. Optional: `slope` (for diagonal: `y = a + slope * x`).
 
 ### text
-Text labels. Required: x, y, label. Settings: `offset` (number or `(h, v)`), `format` (string interpolation like RENAMING). `hjust`: `'left'`/`'right'`/`'centre'` or 0-1. `vjust`: `'top'`/`'bottom'`/`'middle'` or 0-1.
+Text labels. Required: x, y, label. Settings: `offset` (number or `(h, v)`), `format` (string interpolation like RENAMING), `parse` (boolean, default `true`: read the label as markdown — `**bold**`, `*italic*`, `~~strike~~`, `` `code` ``, `{.red span}` — set `false` to draw it literally; not Vega-Lite, which has no rich text). `hjust`: `'left'`/`'right'`/`'centre'` or 0-1. `vjust`: `'top'`/`'bottom'`/`'middle'` or 0-1.
 
 ### rect
 Rectangles. Required: pick 2 per axis from center (x/y), min (xmin/ymin), max (xmax/ymax), width, height. Or just center (defaults width/height to 1).
@@ -405,7 +437,7 @@ Rectangles. Required: pick 2 per axis from center (x/y), min (xmin/ymin), max (x
 Closed shapes from ordered coordinates. Required: x, y. Use PARTITION BY to separate distinct polygons.
 
 ### range
-Range/interval display between two values along the secondary axis. Required: x, ymin, ymax. Settings: `width` (hinge width in points, default 10, null to hide).
+Range/interval display between two values along the secondary axis. Required: x, ymin, ymax. Settings: `hinge` (hinge width in points, default 10, null to hide).
 
 All layers accept common optional aesthetics (colour/stroke, fill, opacity, linewidth, linetype) and `position` setting where applicable.
 
@@ -440,7 +472,7 @@ SCALE x VIA date
 -- Lollipop chart
 SELECT ROUND(bill_dep) AS bill_dep, COUNT(*) AS n FROM ggsql:penguins GROUP BY 1
 VISUALISE bill_dep AS x
-DRAW range MAPPING 0 AS ymin, n AS ymax SETTING width => null
+DRAW range MAPPING 0 AS ymin, n AS ymax SETTING hinge => null
 DRAW point MAPPING n AS y
 
 -- Ridgeline / joy plot
@@ -461,18 +493,38 @@ VISUALISE
 DRAW line MAPPING Date AS x, value AS y, 'Temperature' AS color FROM temps
 DRAW point MAPPING Date AS x, value AS y, 'Ozone' AS color FROM ozone
 SCALE x VIA date
+
+-- Per-week summary: open/close range, weekly temperature change (binned post-aggregate)
+VISUALISE Date AS x, Temp AS ymin, Temp AS ymax, Temp AS color
+  FROM ggsql:airquality
+DRAW range
+  SETTING aggregate => ('x:first', 'ymin:first', 'ymax:last', 'color:diff'),
+          hinge => null
+  PARTITION BY Week
+SCALE BINNED color
+
+-- Mean ± 1.96·sdev band per group, drawn as a ribbon
+VISUALISE Day AS x, Temp AS ymin, Temp AS ymax FROM ggsql:airquality
+DRAW ribbon
+  SETTING aggregate => ('mean-1.96sdev', 'mean+1.96sdev')
+  PARTITION BY Month
 ```
 
 ---
 
 ## CLI
 
-The `ggsql` CLI should be on the PATH. Subcommands: `exec <QUERY>`, `run <FILE>`, `validate <QUERY>`, `parse <QUERY>`. Common options: `--reader <URI>` (default `duckdb://memory`), `--writer <FORMAT>` (default `vegalite`), `--output <PATH>`, `-v` (verbose).
+The `ggsql` CLI should be on the PATH. Subcommands: `exec <QUERY>`, `run <FILE>`, `validate <QUERY>`, `parse <QUERY>`, `view <QUERY>` (native window, blocks until closed). Common options: `--reader <URI>` (default `duckdb://memory`), `--writer <FORMAT>` (default `vegalite`), `--output <PATH>` (its extension picks the writer when `--writer` is omitted), `-D key=value` (writer settings), `-v` (verbose). Writers: `vegalite`, `svg`, `pdf`, `hep` (no GPU needed) and `png`, `jpeg`, `tiff`, `webp` (rasterise on the GPU, not in every build).
+
+**Do not run `ggsql view` unless the user asked for a window.** It blocks until a person closes the window, and you cannot close it yourself. Write a file with `--output` and look at that instead.
+
+**Prefer `svg` or `pdf` when you need a picture**, since they need no GPU adapter. The raster writers do, and discover it only at render time. `ggsql exec --help` lists the writers this build has and names the feature that would add a missing one; it cannot tell you whether an adapter is present.
 
 ```bash
 ggsql validate "VISUALISE x, y FROM data DRAW point"
 ggsql exec "VISUALISE bill_len AS x, bill_dep AS y FROM ggsql:penguins DRAW point" -v
 ggsql run query.sql --output chart.vl.json
+ggsql exec "VISUALISE species AS fill FROM ggsql:penguins DRAW bar" -o chart.svg
 ```
 
 ---
